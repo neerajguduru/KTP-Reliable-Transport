@@ -1,0 +1,82 @@
+Mini Project 1 Submission
+Group Details:
+Member 1 Name: Guduru Neeraj Reddy
+Member 1 Roll number: 23CS10022
+Member 2 Name: Gampa Reshwik
+Member 2 Roll number: 23CS30020
+
+============================================================================
+1. DATA STRUCTURES (ksocket.h)
+============================================================================
+* ktp_message_t: Represents the data actually sent over the UDP socket.
+  - seq_no: 8-bit sequence number.
+  - type: MSG_DATA or MSG_ACK flag.
+  - ack_num: The sequence number of the last in-order message received (piggybacked).
+  - rwnd_size: The available receive window size (piggybacked).
+  - payload: 512-byte fixed array for application data.
+
+* ktp_recv_slot_t: Stripped representation of a message for the receive buffer.
+  - seq_no: The sequence number of the payload.
+  - payload: 512-byte application data.
+
+* sender_window_t: Manages the sender state.
+  - window_size: Current allowable window size (driven by receiver's rwnd).
+  - base: The oldest unacknowledged sequence number.
+  - next_seq: The next sequence number to be utilized.
+
+* receiver_window_t: Manages the receiver state.
+  - window_size: Amount of free space in the receive buffer.
+  - base_seq: The sequence number of the NEXT expected in-order message.
+
+* ktp_socket_entry_t: The core Shared Memory (SM) table entry representing one socket.
+  - is_allotted, pid, udp_sockfd, local_addr, remote_addr, is_bound: Metadata and networking primitives for the socket.
+  - send_buffer, send_head, send_tail, send_count: A circular queue storing raw application data from user calls before they are packetized by Thread S.
+  - send_ts: An array of high-resolution timestamps tracking when each buffered packet was last transmitted. Thread S checks only the base slot's timestamp to trigger Go-Back-N retransmission of the entire window.
+  - recv_buffer, recv_filled, recv_buf_head, recv_buf_count, nospace: A circular array buffering in-order and out-of-order packets received by Thread R before they are consumed by the user.
+  - swnd & rwnd: The sliding window structs defined above.
+  - mutex & mutex_attr: Process-shared POSIX mutexes ('PTHREAD_PROCESS_SHARED') to ensure strict mutual exclusion between the daemon and user processes.
+
+================================================================================
+2. FUNCTIONS IN ksocket.c (User API)
+================================================================================
+* attach_shm(): Internal helper. Attaches the user process to the System V shared memory segment. Ensures attachment happens at most once per process.
+* lock_ktp() / unlock_ktp(): Internal helpers. Wraps pthread_mutex_lock/unlock to provide exclusive access to a specific KTP socket entry.
+* k_socket(): Attaches to SM, finds a free socket entry, marks it as allotted with the caller's PID, and initializes all window and buffer parameters. (Note: It defers the actual UDP socket creation to the daemon).
+* k_bind(): Locks the entry, sets the local and remote sockaddr_in structures, and signals the daemon ('is_bound = true') to open and bind the underlying UDP socket to the specified local port.
+* k_sendto(): Verifies the remote destination. If space exists, writes raw data into the circular send_buffer queue. Enforces the 512-byte payload size via padding.
+* k_recvfrom(): Checks the recv_buffer at recv_buf_head. If an in-order message is present, copies it to the user, slides the receive window forward, and frees the slot.
+* k_close(): Blocks and waits (up to a timeout limit) for the send buffer to fully flush and all packets to be acknowledged. Once complete, marks the SM entry as free.
+* dropMessage(): Initializes a per-thread/process random seed based on clock and PID, then simulates an unreliable link by returning true if a random float is strictly less than probability p.
+
+========================================================================
+3. FUNCTIONS IN initksocket.c (Daemon)
+========================================================================
+* send_ack() / send_data(): Internal helpers that format ktp_message_t structs and transmit them via the standard UDP sendto() call.
+* handle_shutdown(): Signal handler catching SIGINT/SIGTERM to cleanly detach and destroy the System V shared memory segment and kill the child Garbage Collector process.
+* thread_R(): Uses select() to listen to all active UDP sockets. It is also responsible for actively creating, binding, and closing the underlying UDP sockets based on the SM states set by users. Unpacks incoming messages, drops them based on P_DROP, buffers out-of-order data, computes the ACK number by walking contiguous filled slots, and handles incoming ACKs by sliding the sender window and freeing the circular send queue. Also sends duplicate wake-up ACKs if a receiver becomes unblocked ('nospace' clears).
+* thread_S(): Wakes periodically to handle timeouts and transmissions. Checks the elapsed time of the oldest unacknowledged packet ('send_ts[send_head]'), if it has exceeded the timeout limit 'T', retransmits all in-flight packets within the current swnd (Go-Back-N). Iterates the circular send queue to transmit new packets as permitted by the current swnd size. 
+* garbage_collector(): Periodically runs kill(pid, 0) to verify if the user process that originally allocated a socket is still alive. If the process has crashed or terminated unexpectedly, it safely resets the socket entry so it can be reused.
+* main(): Initializes the System V shared memory segment, sets up process-shared mutexes for every socket slot, forks the garbage collector, and spawns threads R and S.
+
+==============================================================================
+4. EXPERIMENTAL RESULTS (T = 5 seconds)
+==============================================================================
+To generate this table, change P_DROP in ksocket.h, recompile using 'make', 
+and run the file transfer of a >100KB file. Track the daemon outputs to count 
+transmissions.
+
++-------------+-----------------------------------------------------------+
+| Probability | Average number of transmissions made to send each message |
+|    (p)      | (Total transmissions / Total unique messages generated)   |
++-------------+-----------------------------------------------------------+
+|    0.05     |                      1.3781                               |
+|    0.10     |                      1.8557                               |
+|    0.15     |                      2.1492                               |
+|    0.20     |                      2.4378                               |
+|    0.25     |                      2.6915                               |
+|    0.30     |                      3.1841                               |
+|    0.35     |                      3.5871                               |
+|    0.40     |                      3.8001                               |
+|    0.45     |                      4.1393                               |
+|    0.50     |                      4.5323                               |
++-------------+-----------------------------------------------------------+
